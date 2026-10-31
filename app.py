@@ -26,6 +26,7 @@ TOKEN = os.environ.get("DISCORD_TOKEN")
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or ""
 KB_BUCKET = "kb"
+HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "50"))
 
 prompt_cache = None
 
@@ -57,6 +58,42 @@ def load_system_prompt():
     print("System prompt loaded.")
     return prompt_cache
 
+def clean_mentions(text, bot_id):
+    return text.replace(f'<@!{bot_id}>', '').replace(f'<@{bot_id}>', '').strip()
+
+def author_label(m):
+    return m.author.display_name or m.author.name
+
+async def build_contents(channel, message, bot_id):
+    # Pull recent channel messages so the bot sees what's going on, oldest first.
+    history = []
+    try:
+        async for m in channel.history(limit=HISTORY_LIMIT, before=message):
+            history.append(m)
+    except Exception as e:
+        print(f"History fetch failed: {type(e).__name__}: {e}")
+    history.reverse()
+    history.append(message)
+
+    contents = []
+    for m in history:
+        text = clean_mentions(m.content or "", bot_id)
+        if not text:
+            if m is message:
+                text = "(mentioned with no text)"
+            else:
+                continue
+        if m.author.id == bot_id:
+            role, line = "model", text
+        else:
+            role, line = "user", f"{author_label(m)}: {text}"
+        # Gemini wants alternating turns, so merge back-to-back messages from the same side.
+        if contents and contents[-1]["role"] == role:
+            contents[-1]["parts"][0]["text"] += "\n" + line
+        else:
+            contents.append({"role": role, "parts": [{"text": line}]})
+    return contents
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -70,8 +107,6 @@ class MyClient(discord.Client):
             return
 
         if self.user in message.mentions:
-            user_message = message.content.replace(f'<@!{self.user.id}>', '').replace(f'<@{self.user.id}>', '').strip()
-
             system_prompt = load_system_prompt()
             if system_prompt is None:
                 await message.reply("I can't load my instructions right now. Try again in a bit.")
@@ -79,9 +114,10 @@ class MyClient(discord.Client):
 
             try:
                 # Async call keeps the bot responsive and fast
+                contents = await build_contents(message.channel, message, self.user.id)
                 response = await client.aio.models.generate_content(
                     model=GEMINI_MODEL,
-                    contents=user_message,
+                    contents=contents,
                     config=types.GenerateContentConfig(
                         system_instruction=system_prompt,
                         temperature=0.7
